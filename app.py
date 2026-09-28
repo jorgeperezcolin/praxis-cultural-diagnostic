@@ -6,17 +6,26 @@ Ejecutar:
     pip install -r requirements.txt
     streamlit run app.py                         # local
     streamlit run app.py --server.address 0.0.0.0  # varios dispositivos en la misma red
+
+Ligas:
+    /?rol=participante&s=PRAXIS-LEON   -> solo el formulario del trío (sin barra lateral ni otros roles)
+    /                                   -> consola; Operador, Conductor y Moderador piden PIN
 """
 
 from __future__ import annotations
 
+import hmac
+import html
 import json
+import os
 import sqlite3
 import time
 from datetime import datetime, timedelta
+from urllib.parse import quote
 
 import altair as alt
 import pandas as pd
+import segno
 import streamlit as st
 
 import engine
@@ -26,6 +35,20 @@ st.set_page_config(page_title="Diagnóstico cultural asistido por IA", page_icon
 DB_PATH = "praxis_demo.db"
 RETENTION_DAYS = 30
 TARGET_SECONDS = 90
+MAX_TRIOS = 40
+DEFAULT_SESSION = "PRAXIS-LEON"
+DEFAULT_PIN = "1234"  # solo para demo local; en Streamlit Cloud se define STAFF_PIN en Secrets
+PROTECTED_ROLES = {"Operador", "Conductor", "Moderador remoto"}
+
+
+def secret(name: str, default: str | None = None) -> str | None:
+    """Lee de st.secrets o de variables de entorno sin fallar si no hay secrets.toml."""
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name])
+    except Exception:
+        pass
+    return os.environ.get(name, default)
 
 PHASES = [
     "PREPARADA", "CAPTURANDO", "CORPUS CONGELADO", "PROCESANDO",
@@ -78,6 +101,10 @@ def init_db() -> None:
               rol TEXT, evento TEXT, detalle TEXT);
             """
         )
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(envios)")}
+        if "trio" not in cols:  # migración de bases creadas por la versión anterior
+            con.execute("ALTER TABLE envios ADD COLUMN trio INTEGER")
+        con.execute("CREATE INDEX IF NOT EXISTS ix_envios_sesion_trio ON envios(sesion, trio)")
 
 
 def purge_old() -> None:
@@ -122,12 +149,37 @@ def set_phase(codigo: str, fase: str, rol: str) -> None:
     log(codigo, rol, "Cambio de fase", fase)
 
 
-def add_submission(codigo: str, seccion: str, supuesto: str, evidencia: str, intensidad: int) -> None:
+def trio_submission(codigo: str, trio: int) -> dict | None:
     with db() as con:
-        con.execute(
-            "INSERT INTO envios (sesion, ts, seccion, supuesto, evidencia, intensidad) VALUES (?,?,?,?,?,?)",
-            (codigo, now(), seccion, supuesto.strip(), evidencia.strip(), int(intensidad)),
+        r = con.execute("SELECT * FROM envios WHERE sesion = ? AND trio = ? ORDER BY id LIMIT 1",
+                        (codigo, int(trio))).fetchone()
+    return dict(r) if r else None
+
+
+def add_submission(codigo: str, seccion: str, supuesto: str, evidencia: str, intensidad: int,
+                   trio: int | None = None) -> int:
+    """Inserta un envío y devuelve su id. Un trío (mesa) solo puede enviar una vez por sesión."""
+    with db() as con:
+        if trio is not None:
+            dup = con.execute("SELECT id FROM envios WHERE sesion = ? AND trio = ?", (codigo, int(trio))).fetchone()
+            if dup:
+                raise ValueError(f"La mesa {trio} ya envió su diagnóstico (#{dup['id']}).")
+        cur = con.execute(
+            "INSERT INTO envios (sesion, ts, seccion, supuesto, evidencia, intensidad, trio) VALUES (?,?,?,?,?,?,?)",
+            (codigo, now(), seccion, supuesto.strip(), evidencia.strip(), int(intensidad),
+             int(trio) if trio is not None else None),
         )
+        return cur.lastrowid
+
+
+def void_submission(codigo: str, envio_id: int, rol: str) -> bool:
+    """Anula un envío durante la captura (p. ej. una mesa se equivocó). Queda en bitácora."""
+    with db() as con:
+        cur = con.execute("DELETE FROM envios WHERE sesion = ? AND id = ? AND congelado = 0", (codigo, int(envio_id)))
+        ok = cur.rowcount > 0
+    if ok:
+        log(codigo, rol, "Envío anulado", f"#{envio_id}")
+    return ok
 
 
 def submissions(codigo: str, solo_congelados: bool = False) -> list[dict]:
@@ -182,8 +234,10 @@ def process(codigo: str, rol: str, inject_error: bool, origen: str = "en vivo") 
 
 
 def load_demo(codigo: str, rol: str, n: int = 32) -> None:
+    usados = {s["trio"] for s in submissions(codigo) if s.get("trio")}
+    libres = (k for k in range(1, 10_000) if k not in usados)
     for s in engine.demo_submissions(n):
-        add_submission(codigo, s["seccion"], s["supuesto"], s["evidencia"], s["intensidad"])
+        add_submission(codigo, s["seccion"], s["supuesto"], s["evidencia"], s["intensidad"], trio=next(libres))
     log(codigo, rol, "Datos demo cargados", f"{n} envíos ficticios")
 
 
@@ -222,6 +276,52 @@ def export_bitacora(codigo: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# Liga de participante, QR y acceso del staff
+# --------------------------------------------------------------------------
+def base_url() -> str:
+    """URL pública de la app: APP_URL en Secrets o, si no, el host de la petición."""
+    configured = secret("APP_URL")
+    if configured:
+        return configured.rstrip("/")
+    try:
+        host = st.context.headers.get("host") or "localhost:8501"
+    except Exception:
+        host = "localhost:8501"
+    scheme = "http" if host.startswith(("localhost", "127.", "0.0.0.0", "192.168.", "10.")) else "https"
+    return f"{scheme}://{host}"
+
+
+def participant_url(codigo: str) -> str:
+    return f"{base_url()}/?rol=participante&s={quote(codigo)}"
+
+
+def qr_svg(url: str, scale: int = 8) -> str:
+    return segno.make(url, error="m").svg_inline(scale=scale, dark="#111111", light="#ffffff", border=2)
+
+
+def staff_pin() -> str:
+    return secret("STAFF_PIN", DEFAULT_PIN) or DEFAULT_PIN
+
+
+def require_pin(rol: str) -> bool:
+    """Devuelve True si este navegador ya se autenticó como staff en esta sesión."""
+    if st.session_state.get("staff_ok"):
+        return True
+    st.subheader(f"{rol} · acceso con PIN")
+    st.caption("Esta vista controla la sesión. Los participantes usan su propia liga o el QR proyectado.")
+    with st.form("pin"):
+        pin = st.text_input("PIN del equipo docente", type="password")
+        ok = st.form_submit_button("Entrar", type="primary")
+    if ok:
+        if hmac.compare_digest(pin.strip(), staff_pin()):
+            st.session_state["staff_ok"] = True
+            st.rerun()
+        else:
+            st.error("PIN incorrecto. Pídelo al operador de la sesión.")
+    return False
+
+
+# --------------------------------------------------------------------------
 # Componentes de UI
 # --------------------------------------------------------------------------
 def phase_bar(fase: str) -> None:
@@ -241,7 +341,7 @@ def bar_chart(df: pd.DataFrame, x: str, y: str, color: str | None = None, height
     chart = alt.Chart(df).mark_bar().encode(**enc).properties(height=height)
     text = alt.Chart(df).mark_text(align="left", dx=4).encode(
         x=f"{x}:Q", y=alt.Y(f"{y}:N", sort="-x"), text=f"{x}:Q")
-    st.altair_chart(chart + text, use_container_width=True)
+    st.altair_chart(chart + text, width="stretch")
 
 
 def clusters_df(reglas: dict) -> pd.DataFrame:
@@ -256,13 +356,19 @@ def clusters_df(reglas: dict) -> pd.DataFrame:
 def view_muro(codigo: str) -> None:
     subs = submissions(codigo)
     c1, c2 = st.columns([1, 3])
-    c1.metric("Envíos recibidos", len(subs))
+    with c1:
+        if get_session(codigo)["fase"] == "CAPTURANDO":
+            url = participant_url(codigo)
+            st.markdown(f"<div style='background:#fff;padding:8px;border-radius:8px;display:inline-block'>{qr_svg(url, 6)}</div>",
+                        unsafe_allow_html=True)
+            st.markdown(f"<div class='mid'><b>Escanea para enviar</b></div><small>{html.escape(url)}</small>", unsafe_allow_html=True)
+        st.metric("Envíos recibidos", f"{len(subs)} / {MAX_TRIOS}")
     por_sec = pd.Series([s["seccion"] for s in subs]).value_counts().reindex(engine.SECTIONS, fill_value=0)
-    c1.dataframe(por_sec.rename("Envíos"), use_container_width=True)
+    c1.dataframe(por_sec.rename("Envíos"), width="stretch")
     with c2:
         st.markdown("<div class='mid'><b>Muro de la sala</b> · últimos supuestos</div>", unsafe_allow_html=True)
         for s in subs[-8:][::-1]:
-            st.markdown(f"<div class='card'>#{s['id']} · Sección {s['seccion']} — {s['supuesto']}</div>",
+            st.markdown(f"<div class='card'>#{s['id']} · Sección {s['seccion']} — {html.escape(s['supuesto'])}</div>",
                         unsafe_allow_html=True)
 
 
@@ -281,7 +387,7 @@ def view_instrumento(run: dict) -> None:
     icon = {"Verificado": "✅", "Parcial": "🟡", "Rechazado": "⛔"}
     for h in run["hallazgos"]:
         st.markdown(
-            f"<div class='card'>{icon[h['estado_auditoria']]} <b>{h['tipo']}</b> — {h['texto']}<br>"
+            f"<div class='card'>{icon[h['estado_auditoria']]} <b>{h['tipo']}</b> — {html.escape(h['texto'])}<br>"
             f"<small>Citas: {h['citas']} · Auditoría: {h['estado_auditoria']} ({h['motivo']})</small></div>",
             unsafe_allow_html=True)
 
@@ -293,11 +399,11 @@ def view_contraste(run: dict, s: dict) -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("<div class='mid'><b>Apuesta previa del grupo</b></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='card'>{s['apuesta'] or '— sin apuesta registrada —'}<br>"
+        st.markdown(f"<div class='card'>{html.escape(s['apuesta'] or '— sin apuesta registrada —')}<br>"
                     f"<small>Registrada: {s['apuesta_ts'] or 'n/d'}</small></div>", unsafe_allow_html=True)
     with c2:
         st.markdown("<div class='mid'><b>Supuesto dominante (reglas)</b></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='card'>{dom['etiqueta']}<br><small>{dom['n']} tríos · {int(dom['cuota']*100)}%</small></div>",
+        st.markdown(f"<div class='card'>{html.escape(dom['etiqueta'])}<br><small>{dom['n']} tríos · {int(dom['cuota']*100)}%</small></div>",
                     unsafe_allow_html=True)
     if s["apuesta"]:
         sim = engine.bet_similarity(s["apuesta"], dom["etiqueta"])
@@ -322,7 +428,7 @@ def view_contraste(run: dict, s: dict) -> None:
 
 def view_criterio(s: dict) -> None:
     st.markdown("<div class='big'>Criterio humano</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card mid'>{s['criterio'] or '— pendiente de registrar por el Conductor —'}</div>",
+    st.markdown(f"<div class='card mid'>{html.escape(s['criterio'] or '— pendiente de registrar por el Conductor —')}</div>",
                 unsafe_allow_html=True)
 
 
@@ -338,7 +444,7 @@ def view_bitacora(codigo: str, run: dict | None) -> None:
     with db() as con:
         ev = pd.DataFrame([dict(r) for r in con.execute(
             "SELECT ts, rol, evento, detalle FROM bitacora WHERE sesion = ? ORDER BY id DESC", (codigo,))])
-    st.dataframe(ev, use_container_width=True, hide_index=True)
+    st.dataframe(ev, width="stretch", hide_index=True)
 
 
 def render_projection(codigo: str, fase: str, override: str | None = None) -> None:
@@ -347,7 +453,7 @@ def render_projection(codigo: str, fase: str, override: str | None = None) -> No
     view = override or fase
     if view in ("PREPARADA",):
         st.markdown(f"<div class='big'>Diagnóstico cultural · Caso Praxis</div>"
-                    f"<div class='mid'>Sesión {codigo} · espera la apertura de la captura</div>", unsafe_allow_html=True)
+                    f"<div class='mid'>Sesión {html.escape(codigo)} · espera la apertura de la captura</div>", unsafe_allow_html=True)
     elif view in ("CAPTURANDO", "MURO"):
         view_muro(codigo)
     elif view == "CORPUS CONGELADO":
@@ -373,25 +479,57 @@ def render_projection(codigo: str, fase: str, override: str | None = None) -> No
 # Vistas por rol
 # --------------------------------------------------------------------------
 def role_participante(codigo: str, s: dict) -> None:
-    st.subheader("Hoja del participante · envío por trío")
-    st.caption("No se piden nombres, correos ni datos personales. Un envío por trío.")
-    if s["fase"] != "CAPTURANDO":
-        st.info(f"La captura no está abierta (fase actual: {s['fase']}).")
+    st.subheader("Diagnóstico cultural · Caso Praxis")
+    st.caption("Un envío por trío. No se piden nombres, correos ni datos personales.")
+    enviados = st.session_state.setdefault("enviados", {})
+
+    # Confirmación persistente: si este celular ya envió en esta sesión, se muestra el recibo y no el formulario.
+    if codigo in enviados:
+        r = enviados[codigo]
+        st.success(f"✅ Recibido · envío #{r['id']} · mesa {r['mesa']}")
+        st.markdown(f"<div class='card'><b>Su supuesto:</b> {html.escape(r['supuesto'])}</div>", unsafe_allow_html=True)
+        st.caption("Ya puede ver su envío en la pantalla. Si hay un error, avise al operador para que lo anule.")
         return
-    with st.form("envio", clear_on_submit=True):
+
+    if s["fase"] != "CAPTURANDO":
+        st.info("La captura todavía no está abierta. Esta página se actualiza sola en cuanto el profesor la abra."
+                if s["fase"] == "PREPARADA" else "La captura ya cerró. Gracias por participar.")
+
+        @st.fragment(run_every="3s")
+        def wait_for_open():
+            if get_session(codigo)["fase"] == "CAPTURANDO":
+                st.rerun()
+
+        if s["fase"] == "PREPARADA":
+            wait_for_open()
+        return
+
+    with st.form("envio"):
+        mesa = st.number_input("Número de mesa del trío", min_value=1, max_value=MAX_TRIOS, step=1, value=None,
+                               placeholder=f"1 a {MAX_TRIOS}", help="Lo indica la tarjeta de su mesa. Evita envíos duplicados.")
         seccion = st.selectbox("Sección del grupo", engine.SECTIONS)
-        supuesto = st.text_area("Supuesto cultural", value="En Praxis se asume que ",
+        supuesto = st.text_area("Supuesto cultural", value="En Praxis se asume que ", max_chars=280,
                                 help="Complete la frase con el supuesto que su trío identifica.")
-        evidencia = st.text_area("Evidencia del caso", help="Hecho o pasaje del caso que sostiene el supuesto.")
+        evidencia = st.text_area("Evidencia del caso", max_chars=400,
+                                 help="Hecho o pasaje del caso que sostiene el supuesto.")
         intensidad = st.slider("Intensidad (qué tanto pesa en la conducta)", 1, 5, 3)
-        ok = st.form_submit_button("Enviar diagnóstico", type="primary")
+        ok = st.form_submit_button("Enviar diagnóstico", type="primary", width="stretch")
     if ok:
-        if len(engine.normalize(supuesto)) < 8:
-            st.error("El supuesto está vacío o incompleto.")
+        if mesa is None:
+            st.error("Indique el número de mesa antes de enviar.")
+        elif len(engine.normalize(supuesto)) < 8:
+            st.error("El supuesto está vacío o incompleto: complete la frase «En Praxis se asume que…».")
+        elif get_session(codigo)["fase"] != "CAPTURANDO":
+            st.error("La captura se cerró mientras escribían. Avisen al profesor.")
         else:
-            t0 = time.perf_counter()
-            add_submission(codigo, seccion, supuesto, evidencia, intensidad)
-            st.success(f"Recibido en {time.perf_counter()-t0:.2f} s. Gracias.")
+            try:
+                t0 = time.perf_counter()
+                envio_id = add_submission(codigo, seccion, supuesto, evidencia, intensidad, trio=int(mesa))
+                enviados[codigo] = {"id": envio_id, "mesa": int(mesa), "supuesto": supuesto.strip(),
+                                    "t": round(time.perf_counter() - t0, 2)}
+                st.rerun()
+            except ValueError as e:
+                st.error(f"{e} Si es un error, avisen al operador para que lo anule.")
 
 
 def role_operador(codigo: str, s: dict) -> None:
@@ -406,18 +544,18 @@ def role_operador(codigo: str, s: dict) -> None:
 
     st.markdown("#### Flujo")
     b1, b2, b3, b4 = st.columns(4)
-    if b1.button("Abrir captura", disabled=fase != "PREPARADA", use_container_width=True):
+    if b1.button("Abrir captura", disabled=fase != "PREPARADA", width="stretch"):
         set_phase(codigo, "CAPTURANDO", "Operador"); st.rerun()
-    if b2.button("Congelar corpus", disabled=fase != "CAPTURANDO" or not subs, use_container_width=True):
+    if b2.button("Congelar corpus", disabled=fase != "CAPTURANDO" or not subs, width="stretch"):
         freeze(codigo, "Operador"); st.rerun()
     inject = st.checkbox("Demostrar auditoría: inyectar una afirmación sin sustento en la IA", value=True)
     if b3.button("Procesar (reglas + IA + auditor)", type="primary",
-                 disabled=fase != "CORPUS CONGELADO", use_container_width=True):
+                 disabled=fase != "CORPUS CONGELADO", width="stretch"):
         with st.spinner("Procesando…"):
             t = process(codigo, "Operador", inject_error=inject)
         st.toast(f"Cierre → tablero: {t['cierre_a_tablero_s']} s"); st.rerun()
     nxt = PHASES[idx + 1] if idx + 1 < len(PHASES) and idx >= PHASES.index("SALA") else None
-    if b4.button(f"Avanzar a {nxt}" if nxt else "Avanzar", disabled=nxt is None, use_container_width=True):
+    if b4.button(f"Avanzar a {nxt}" if nxt else "Avanzar", disabled=nxt is None, width="stretch"):
         set_phase(codigo, nxt, "Operador"); st.rerun()
 
     st.markdown("#### Plan B")
@@ -442,14 +580,22 @@ def role_operador(codigo: str, s: dict) -> None:
     run = latest_run(codigo)
     if run:
         st.markdown("#### Resultado del motor de reglas")
-        st.dataframe(clusters_df(run["reglas"]), use_container_width=True, hide_index=True)
+        st.dataframe(clusters_df(run["reglas"]), width="stretch", hide_index=True)
         t = run["tiempos"]
         ok = t["cierre_a_tablero_s"] <= TARGET_SECONDS
         st.markdown(f"Cierre → tablero: **{t['cierre_a_tablero_s']} s** {'✅' if ok else '⛔'} (meta ≤{TARGET_SECONDS} s)")
     if subs:
         with st.expander(f"Corpus ({len(subs)} envíos)"):
-            st.dataframe(pd.DataFrame(subs)[["id", "seccion", "supuesto", "evidencia", "intensidad", "congelado"]],
-                         use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(subs)[["id", "trio", "seccion", "supuesto", "evidencia", "intensidad", "congelado"]]
+                         .rename(columns={"trio": "mesa"}), width="stretch", hide_index=True)
+            if fase == "CAPTURANDO":
+                cX, cY = st.columns([1, 2])
+                anular = cX.number_input("Envío a anular (#)", min_value=1, step=1, value=None, key="anular_id")
+                if cY.button("Anular envío", disabled=anular is None):
+                    if void_submission(codigo, int(anular), "Operador"):
+                        st.toast(f"Envío #{int(anular)} anulado"); st.rerun()
+                    else:
+                        st.error("No existe un envío abierto con ese número.")
 
 
 def role_conductor(codigo: str, s: dict) -> None:
@@ -507,7 +653,7 @@ def role_moderador(codigo: str, s: dict) -> None:
     phase_bar(s["fase"])
     run = latest_run(codigo)
     if run:
-        st.dataframe(clusters_df(run["reglas"]), use_container_width=True, hide_index=True)
+        st.dataframe(clusters_df(run["reglas"]), width="stretch", hide_index=True)
     view_bitacora(codigo, run)
 
 
@@ -517,18 +663,39 @@ def role_moderador(codigo: str, s: dict) -> None:
 def main() -> None:
     init_db()
     purge_old()
+    qp = st.query_params
+    codigo_qp = (qp.get("s") or "").strip().upper()
+
+    # Liga de participante: solo el formulario, sin barra lateral ni acceso a otros roles.
+    if (qp.get("rol") or "").lower() == "participante":
+        st.markdown("<style>[data-testid='stSidebar'],[data-testid='stSidebarCollapsedControl'],"
+                    "[data-testid='collapsedControl']{display:none}</style>", unsafe_allow_html=True)
+        codigo = codigo_qp or DEFAULT_SESSION
+        role_participante(codigo, get_session(codigo))
+        return
+
     st.sidebar.title("🧭 Diagnóstico cultural")
     st.sidebar.caption("Caso Praxis · DP 26 C 02 · método DP 26 N 03")
-    codigo = st.sidebar.text_input("Código de sesión", value="PRAXIS-LEON").strip().upper() or "PRAXIS-LEON"
-    rol = st.sidebar.radio("Rol", ROLES)
+    codigo = st.sidebar.text_input("Código de sesión", value=codigo_qp or DEFAULT_SESSION).strip().upper() or DEFAULT_SESSION
+    rol = st.sidebar.radio("Rol", ROLES, index=ROLES.index("Proyección"))
     s = get_session(codigo)
 
     st.sidebar.divider()
-    st.sidebar.download_button("Descargar bitácora (JSON)", export_bitacora(codigo),
-                               file_name=f"bitacora_{codigo}.json", mime="application/json")
+    if st.session_state.get("staff_ok"):
+        st.sidebar.markdown("**Liga para los tríos**")
+        st.sidebar.code(participant_url(codigo), language=None)
+        st.sidebar.download_button("Descargar bitácora (JSON)", export_bitacora(codigo),
+                                   file_name=f"bitacora_{codigo}.json", mime="application/json")
+        if staff_pin() == DEFAULT_PIN:
+            st.sidebar.warning("PIN de demostración activo. Define STAFF_PIN en Secrets antes de la sesión real.")
+        if st.sidebar.button("Salir del modo docente"):
+            st.session_state["staff_ok"] = False; st.rerun()
     st.sidebar.caption("Maqueta · IA simulada · sin datos personales · retención 30 días")
 
+    if rol in PROTECTED_ROLES and not require_pin(rol):
+        return
     if rol == "Participante":
+        st.caption("Vista previa del formulario. Los tríos usan la liga o el QR, que muestran solo esta pantalla.")
         role_participante(codigo, s)
     elif rol == "Operador":
         role_operador(codigo, s)

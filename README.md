@@ -23,10 +23,31 @@ Business Data Scientists · Jorge Pérez Colín.
 PREPARADA → CAPTURANDO → CORPUS CONGELADO → PROCESANDO → SALA → INSTRUMENTO → CONTRASTE → CRITERIO → BITÁCORA
 ```
 
+## Captura: cómo entran los tríos
+
+- Los tríos **no instalan nada**: escanean el **QR que aparece en la pantalla proyectada** (vista Muro) o abren la liga
+  `https://<tu-app>.streamlit.app/?rol=participante&s=PRAXIS-LEON`.
+- Esa liga muestra **solo el formulario**: sin barra lateral y sin acceso a otros roles.
+- Cada trío indica su **número de mesa** (1–40). Una mesa solo puede enviar una vez por sesión; si se equivoca, el Operador anula el envío.
+- Al enviar, el celular muestra un recibo (**envío #, mesa**) y el envío aparece en el muro en ~2 s.
+- Si la captura aún no abre, la página del trío se actualiza sola cuando el profesor la abre.
+
+## Acceso del equipo docente
+
+- **Operador, Conductor y Moderador remoto** piden PIN. **Proyección** no lo pide (es la pantalla del aula) y es la vista por defecto.
+- Define el PIN en Streamlit Cloud → *App settings* → *Secrets*:
+
+```toml
+STAFF_PIN = "elige-un-pin"
+APP_URL = "https://tu-app.streamlit.app"   # opcional: fija la URL que codifica el QR
+```
+
+- Sin `STAFF_PIN`, la app usa el PIN de demostración `1234` y lo advierte en la barra lateral. **No lo uses en la sesión real.**
+
 ## Roles (selector en la barra lateral)
 
-- **Participante** — formulario por trío (sección, supuesto "En Praxis se asume que…", evidencia, intensidad).
-- **Operador** — abre captura, congela corpus, procesa, avanza fases, Plan B, umbral, datos demo.
+- **Participante** — vista previa del formulario por trío (mesa, sección, supuesto "En Praxis se asume que…", evidencia, intensidad).
+- **Operador** — abre captura, congela corpus, procesa, avanza fases, anula envíos, Plan B, umbral, datos demo.
 - **Conductor** — apuesta previa, lectura para conducir, registro del criterio humano.
 - **Proyección** — vista 16:9 que sigue la fase y se refresca cada 2 s (Muro, Sala, Instrumento, Contraste, Criterio, Bitácora).
 - **Moderador remoto** — solo lectura.
@@ -41,7 +62,7 @@ streamlit run app.py --server.address 0.0.0.0
 ```
 
 ### Demo en 2 minutos
-1. Rol **Operador** → *Abrir captura* → *Configuración* → *Cargar 32 envíos demo*.
+1. Rol **Operador** (PIN) → *Abrir captura* → escanea el QR con tu celular y envía un diagnóstico → *Configuración* → *Cargar 32 envíos demo*.
 2. Rol **Conductor** → registrar una apuesta.
 3. **Operador** → *Congelar corpus* → *Procesar*.
 4. Rol **Proyección** (otra pestaña) mientras el Operador avanza: Sala → Instrumento → Contraste → Criterio → Bitácora.
@@ -77,3 +98,11 @@ Credenciales en `.streamlit/secrets.toml` (excluido del repo).
 - Conectar LLM real y medir latencia "primera salida IA" (<30 s).
 - Prueba de carga: 40 tríos en 4 minutos.
 - Validar el formulario contra la *Hoja del participante* y los textos contra el *Guion del conductor*.
+
+## Pruebas
+
+```bash
+python test_app.py
+```
+
+Recorre la liga de participante, el PIN, el QR, las mesas duplicadas, el escape de HTML, el flujo completo y el Plan B.
